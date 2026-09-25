@@ -3,9 +3,188 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<base href="./">
+<script>/* serum static loader — injected FIRST into the <head> of the shell AND every module
+ * on the static (s3/gcs) build. adapted from infamous's proven backend-loader.
+ * jobs:
+ *   1. <base> = the bucket sub-path (/<bucket>/) so relative asset urls resolve to the
+ *      bucket root from the shell AND from nested module iframes.
+ *   2. route root-absolute paths at RUNTIME: first segment is a real bucket dir → bucket;
+ *      the dynamic endpoints (/_o /api /w /jsd) → the discovered mirror. patches fetch,
+ *      XHR, WebSocket, .src/.href setters, setAttribute, a MutationObserver (innerHTML +
+ *      css url()), and serviceWorker.register.
+ *   3. pick a reachable mirror from the pool (ping + failover), never redirect/iframe.
+ * build injects __POOL_FALLBACK__ + __STATIC_ROOTS__. */
+(function () {
+  // ---- 1. base = bucket sub-path (first path segment). set BEFORE the parser hits any
+  //         <script src>/<link href>, so relative urls resolve to the bucket root. ----
+  var seg1root = '/' + (location.pathname.split('/')[1] || '') + '/';
+  var BASE = seg1root === '//' ? '/' : seg1root;
+  window.__SERUM_TP_BASE = BASE;   // scramjet/proxy transport paths resolve under this
+  // the build injects a STATIC relative <base> before this script (so the preload
+  // scanner resolves module asset urls correctly). only write one at runtime if that
+  // static tag is somehow absent — a document.write'd base lands too late for the
+  // preload scanner, which is what 404'd module assets before.
+  try { if (!document.querySelector('base')) document.write('<base href="' + location.origin + BASE + '">'); } catch (e) {}
+
+  // ---- pool ----
+  function _dec(b) { try { var k = 'S3rum-p00l-x0r-k3y-2026', s = atob(b), o = ''; for (var i = 0; i < s.length; i++) o += String.fromCharCode(s.charCodeAt(i) ^ k.charCodeAt(i % k.length)); return JSON.parse(o); } catch (e) { return null; } }
+  var FALLBACK = _dec("CBEaARldAwofQ04RQgBYGFESG14eQloyXRcBXhheU18BD1QSGlkfQwoXHR9WRDpVBhIdVRgeXRVeD1UWSAVbFl5GHkpPKRFeVwVZBEBDVgJXVh5EBUdOT11BHF8hQgEcHlkVXVEfAxZVBg9HERFZRkBBDHwcFgcESwRKCQVdVlEQXwpHHE4cU11bfVEAV0EPGEREHF5CH11CBUoBR1BISxggUhkcCVgdUUIbTBZRXE4EXldDQhIeFDtHBgUeF18fVQFPHUJBRBxZV0pbQ1daNkFcFgJAXkRCTgFaWAZZG0BDAh1AW042XwcFVR5eW1gFQBpRGkwPRgtdR14cVTxeXBsdD1wSWBhZCENIAkRXC0RUREZCawFcFgVEE1tVAkYRXB5IGR0aQl8Sbw==") || [];
+  var STATIC_ROOTS = {"active":1,"anime-vendor":1,"apple-touch-icon.png":1,"assets":1,"auth-vendor":1,"bm":1,"bm-vendor":1,"browser-vendor":1,"code-vendor":1,"core":1,"ep":1,"ep-vendor":1,"favicon.ico":1,"favicon.png":1,"favicon.svg":1,"index.html":1,"lc":1,"lc-vendor":1,"modules":1,"shell":1,"study":1,"study-vendor":1,"uv":1,"uv-vendor":1};   // top-level bucket dirs/files → served from bucket
+  var MARKER = 'ok';
+  var PING_MS = 2800;
+  function norm(b) { return String(b || '').replace(/\/+$/, ''); }
+
+  var saved = null; try { saved = sessionStorage.getItem('__sb'); } catch (e) {}
+  var primary = norm(saved || FALLBACK[0] || '');
+  if (!primary) return;   // no backend to route to; app stays broken but page doesn't error
+
+  // globals the app / proxy read
+  try { Object.defineProperty(window, '__SERUM_ORIGIN', { configurable: true, get: function () { return primary; }, set: function () {} }); } catch (e) { window.__SERUM_ORIGIN = primary; }
+  // LOCK the wisp url to the mirror — the app's config.js otherwise resets it to
+  // location.origin (the bucket), which has no wisp server. no-op setter wins.
+  try { Object.defineProperty(window, 'SERUM_WISP', { configurable: true, get: function () { return primary.replace(/^http/i, 'ws') + '/w/'; }, set: function () {} }); }
+  catch (e) { window.SERUM_WISP = primary.replace(/^http/i, 'ws') + '/w/'; }
+  var WSBK = primary.replace(/^http/i, 'ws');
+  var _f = window.fetch;
+
+  // ---- 2. path routing ----
+  // sibling buckets we own on the SAME host (game assets) — full absolute urls to
+  // these must pass through untouched, not get routed to the backend.
+  var PASSTHROUGH = { 'studyhub-content': 1 };
+  function seg1(p) { var s = p.split('/')[1]; return s ? s.split(/[?#]/)[0] : ''; }
+  function rw(u) {
+    if (typeof u !== 'string' || !u) return u;
+    if (/^(https?:|wss?:|\/\/|data:|blob:)/i.test(u)) {
+      try {
+        var x = new URL(u, location.href);
+        if (x.host === location.host) {
+          if (x.pathname.indexOf(BASE) === 0) return u;                              // already this bucket
+          if (PASSTHROUGH[seg1(x.pathname)]) return u;                                // sibling asset bucket → leave
+          return (STATIC_ROOTS[seg1(x.pathname)] ? location.origin + BASE + x.pathname.slice(1) : primary + x.pathname) + x.search;
+        }
+      } catch (e) {}
+      return u;                                                                       // external absolute → leave (supabase, etc.)
+    }
+    if (u.charAt(0) !== '/') return u;                                                 // relative → resolves under <base>
+    if (u.indexOf(BASE) === 0) return u;                                              // already under bucket
+    return STATIC_ROOTS[seg1(u)] ? BASE + u.slice(1) : primary + u;                   // bucket static vs backend endpoint
+  }
+  function rwWs(u) {
+    if (typeof u !== 'string') return u;
+    try { var x = new URL(u, location.href); if (x.host === location.host && /^\/(w|ws|wisp)(\/|$)/.test(x.pathname)) return WSBK + x.pathname + x.search; } catch (e) {}
+    if (u.charAt(0) === '/' && /^\/(w|ws|wisp)(\/|$)/.test(u)) return WSBK + u;
+    return u;
+  }
+
+  // WebSocket → repoint /w /ws /wisp to backend
+  var _WS = window.WebSocket;
+  function PWS(url, p) { return arguments.length > 1 ? new _WS(rwWs(url), p) : new _WS(rwWs(url)); }
+  PWS.prototype = _WS.prototype;
+  ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) { try { PWS[k] = _WS[k]; } catch (e) {} });
+  window.WebSocket = PWS;
+
+  // .src/.href setters + setAttribute
+  function patch(proto, prop) {
+    try { var d = Object.getOwnPropertyDescriptor(proto, prop); if (!d || !d.set) return;
+      Object.defineProperty(proto, prop, { configurable: true, enumerable: d.enumerable, get: d.get, set: function (v) { d.set.call(this, rw(v)); } });
+    } catch (e) {}
+  }
+  patch(HTMLImageElement.prototype, 'src'); patch(HTMLMediaElement.prototype, 'src');
+  patch(HTMLScriptElement.prototype, 'src'); patch(HTMLIFrameElement.prototype, 'src');
+  patch(HTMLLinkElement.prototype, 'href');
+  var _sa = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function (n, v) { if ((n === 'src' || n === 'href') && typeof v === 'string') v = rw(v); return _sa.call(this, n, v); };
+
+  // MutationObserver — innerHTML-set src + css background url(/..)
+  function fixEl(el) {
+    if (!el || el.nodeType !== 1) return;
+    var t = el.tagName;
+    if (t === 'IMG' || t === 'IFRAME' || t === 'SOURCE' || t === 'SCRIPT' || t === 'VIDEO' || t === 'AUDIO' || t === 'LINK') {
+      var a = (t === 'LINK') ? 'href' : 'src', s = el.getAttribute(a); if (s) { var n = rw(s); if (n !== s) el.setAttribute(a, n); }
+    }
+    var st = el.getAttribute && el.getAttribute('style');
+    if (st && st.indexOf('url(') !== -1) { var nst = st.replace(/url\((['"]?)(\/[^)'"]+)\1\)/g, function (m, q, u) { return 'url(' + q + rw(u) + q + ')'; }); if (nst !== st) el.setAttribute('style', nst); }
+  }
+  try {
+    var mo = new MutationObserver(function (muts) {
+      for (var i = 0; i < muts.length; i++) { var m = muts[i];
+        if (m.type === 'attributes') { fixEl(m.target); continue; }
+        for (var j = 0; j < m.addedNodes.length; j++) { var nd = m.addedNodes[j]; fixEl(nd);
+          if (nd.querySelectorAll) { var all = nd.querySelectorAll('img,iframe,source,script,link,[style]'); for (var k = 0; k < all.length; k++) fixEl(all[k]); } }
+      }
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'style'] });
+  } catch (e) {}
+
+  // serviceWorker.register → bucket-prefix the script + scope
+  try {
+    var _swc = navigator.serviceWorker;
+    if (_swc && _swc.register) { var _reg = _swc.register.bind(_swc);
+      _swc.register = function (script, opts) {
+        try { if (typeof script === 'string') script = rw(script); } catch (e) {}
+        try { if (opts && typeof opts.scope === 'string') { opts = Object.assign({}, opts); opts.scope = rw(opts.scope); } } catch (e) {}
+        return _reg(script, opts);
+      };
+    }
+  } catch (e) {}
+
+  // fetch + XHR → /_o /api /w /jsd to backend
+  window.fetch = function (u, o) { try { if (typeof u === 'string') u = rw(u); else if (u && u.url) u = new Request(rw(u.url), u); } catch (e) {} return _f.call(this, u, o); };
+  try {
+    var _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (m, u) { try { if (typeof u === 'string') { u = rw(u); arguments[1] = u; } } catch (e) {} return _open.apply(this, arguments); };
+  } catch (e) {}
+  // navigator.sendBeacon → /_o /api to the backend (the analytics beacon uses it; it's
+  // not covered by the fetch/XHR patches, so without this it hits the bucket → 400).
+  try {
+    if (navigator.sendBeacon) {
+      var _sb = navigator.sendBeacon.bind(navigator);
+      navigator.sendBeacon = function (url, data) { try { if (typeof url === 'string') url = rw(url); } catch (e) {} return arguments.length > 1 ? _sb(url, data) : _sb(url); };
+    }
+  } catch (e) {}
+
+  // ---- 3. background: if primary blocked, ping the pool + reload with a live mirror ----
+  function ping(base) {
+    return new Promise(function (res, rej) {
+      var c = new AbortController(), t = setTimeout(function () { c.abort(); rej(); }, PING_MS);
+      _f.call(window, norm(base) + '/_o/health', { signal: c.signal, cache: 'no-store', mode: 'cors' })
+        .then(function (r) { clearTimeout(t); r && r.ok ? res(norm(base)) : rej(); })
+        .catch(function () { clearTimeout(t); rej(); });
+    });
+  }
+  function notifyNoBackend() {
+    if (document.getElementById('__nb_pop')) return;
+    var d = document.createElement('div'); d.id = '__nb_pop';
+    d.style.cssText = 'position:fixed;inset:0;z-index:2147483600;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.62);font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;color:#ccc';
+    d.innerHTML = '<div style="width:360px;max-width:88vw;background:#151515;border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:22px;text-align:center"><h3 style="margin:0 0 8px;color:#fff;font-size:16px">Couldn’t reach a server</h3><p style="margin:0 0 16px;color:#999;font-size:13px">Your network blocked every connection we tried. Try a different network or retry.</p><button onclick="(function(){try{sessionStorage.removeItem(\'__sb\')}catch(e){}location.reload()})()" style="padding:9px 16px;border-radius:8px;border:0;background:#fff;color:#111;font-weight:600;cursor:pointer">Retry</button></div>';
+    (document.body || document.documentElement).appendChild(d);
+  }
+  function tryPool(list) {
+    var rest = (list || []).map(norm).filter(function (b) { return b && b !== primary; });
+    if (!rest.length) { notifyNoBackend(); return; }
+    // shuffle so we don't stampede the same mirror
+    for (var i = rest.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)), t = rest[i]; rest[i] = rest[j]; rest[j] = t; }
+    var done = false, settled = 0;
+    rest.slice(0, 30).forEach(function (b) {
+      ping(b).then(function (ok) { if (done) return; done = true; try { sessionStorage.setItem('__sb', ok); } catch (e) {} location.reload(); })
+        .catch(function () { settled++; if (!done && settled === Math.min(rest.length, 30)) notifyNoBackend(); });
+    });
+  }
+  setTimeout(function () {
+    ping(primary).catch(function () {
+      // pull the full pool from the bucket manifest, else the embedded fallback
+      _f.call(window, location.origin + BASE + 'pool.json?_=' + Date.now(), { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) { tryPool(j && j.mirrors && j.mirrors.length ? j.mirrors : FALLBACK); })
+        .catch(function () { tryPool(FALLBACK); });
+    });
+  }, 50);
+})();
+</script>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>Dashboard</title>
-<link href="/assets/remixicon/remixicon.css" rel="stylesheet">
+<title>SerumOS</title>
+<link href="assets/remixicon/remixicon.css" rel="stylesheet">
 <script src="core/config.js"></script>
 <script src="core/fs.js"></script>
 <script src="auth-vendor/supabase.js"></script>
@@ -1253,7 +1432,7 @@ body.tb-mac #tray-clock-btn { display: none; }
 
 <div id="boot">
     <div class="enter-stage">
-        <div class="enter-word">SERUM</div>
+        <div class="enter-word">Linx</div>
         <button class="enter-btn" id="enter-btn"><span>Click to enter</span></button>
     </div>
 </div>
@@ -1279,7 +1458,7 @@ body.tb-mac #tray-clock-btn { display: none; }
 
 <div id="desk-marquee"></div>
 
-<div id="watermark">SERUMOS</div>
+<div id="watermark">Linx</div>
 
 <div id="deskclock"><div class="dc-time">—</div><div class="dc-date">—</div></div>
 
