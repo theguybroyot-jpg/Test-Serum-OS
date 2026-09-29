@@ -1,0 +1,327 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<base href="../../">
+<script>/* serum static loader — injected FIRST into the <head> of the shell AND every module
+ * on the static (s3/gcs) build. adapted from infamous's proven backend-loader.
+ * jobs:
+ *   1. <base> = the bucket sub-path (/<bucket>/) so relative asset urls resolve to the
+ *      bucket root from the shell AND from nested module iframes.
+ *   2. route root-absolute paths at RUNTIME: first segment is a real bucket dir → bucket;
+ *      the dynamic endpoints (/_o /api /w /jsd) → the discovered mirror. patches fetch,
+ *      XHR, WebSocket, .src/.href setters, setAttribute, a MutationObserver (innerHTML +
+ *      css url()), and serviceWorker.register.
+ *   3. pick a reachable mirror from the pool (ping + failover), never redirect/iframe.
+ * build injects __POOL_FALLBACK__ + __STATIC_ROOTS__. */
+(function () {
+  // ---- 1. base = bucket sub-path (first path segment). set BEFORE the parser hits any
+  //         <script src>/<link href>, so relative urls resolve to the bucket root. ----
+  var seg1root = '/' + (location.pathname.split('/')[1] || '') + '/';
+  var BASE = seg1root === '//' ? '/' : seg1root;
+  window.__SERUM_TP_BASE = BASE;   // scramjet/proxy transport paths resolve under this
+  // the build injects a STATIC relative <base> before this script (so the preload
+  // scanner resolves module asset urls correctly). only write one at runtime if that
+  // static tag is somehow absent — a document.write'd base lands too late for the
+  // preload scanner, which is what 404'd module assets before.
+  try { if (!document.querySelector('base')) document.write('<base href="' + location.origin + BASE + '">'); } catch (e) {}
+
+  // ---- pool ----
+  function _dec(b) { try { var k = 'S3rum-p00l-x0r-k3y-2026', s = atob(b), o = ''; for (var i = 0; i < s.length; i++) o += String.fromCharCode(s.charCodeAt(i) ^ k.charCodeAt(i % k.length)); return JSON.parse(o); } catch (e) { return null; } }
+  var FALLBACK = _dec("CBEaARldAwofQ04RQgBYGFESG14eQloyXRcBXhheU18BD1QSGlkfQwoXHR9WRDpVBhIdVRgeXRVeD1UWSAVbFl5GHkpPKRFeVwVZBEBDVgJXVh5EBUdOT11BHF8hQgEcHlkVXVEfAxZVBg9HERFZRkBBDHwcFgcESwRKCQVdVlEQXwpHHE4cU11bfVEAV0EPGEREHF5CH11CBUoBR1BISxggUhkcCVgdUUIbTBZRXE4EXldDQhIeFDtHBgUeF18fVQFPHUJBRBxZV0pbQ1daNkFcFgJAXkRCTgFaWAZZG0BDAh1AW042XwcFVR5eW1gFQBpRGkwPRgtdR14cVTxeXBsdD1wSWBhZCENIAkRXC0RUREZCawFcFgVEE1tVAkYRXB5IGR0aQl8Sbw==") || [];
+  var STATIC_ROOTS = {"active":1,"anime-vendor":1,"apple-touch-icon.png":1,"assets":1,"auth-vendor":1,"bm":1,"bm-vendor":1,"browser-vendor":1,"code-vendor":1,"core":1,"ep":1,"ep-vendor":1,"favicon.ico":1,"favicon.png":1,"favicon.svg":1,"index.html":1,"lc":1,"lc-vendor":1,"modules":1,"shell":1,"study":1,"study-vendor":1,"uv":1,"uv-vendor":1};   // top-level bucket dirs/files → served from bucket
+  var MARKER = 'ok';
+  var PING_MS = 2800;
+  function norm(b) { return String(b || '').replace(/\/+$/, ''); }
+
+  var saved = null; try { saved = sessionStorage.getItem('__sb'); } catch (e) {}
+  var primary = norm(saved || FALLBACK[0] || '');
+  if (!primary) return;   // no backend to route to; app stays broken but page doesn't error
+
+  // globals the app / proxy read
+  try { Object.defineProperty(window, '__SERUM_ORIGIN', { configurable: true, get: function () { return primary; }, set: function () {} }); } catch (e) { window.__SERUM_ORIGIN = primary; }
+  // LOCK the wisp url to the mirror — the app's config.js otherwise resets it to
+  // location.origin (the bucket), which has no wisp server. no-op setter wins.
+  try { Object.defineProperty(window, 'SERUM_WISP', { configurable: true, get: function () { return primary.replace(/^http/i, 'ws') + '/w/'; }, set: function () {} }); }
+  catch (e) { window.SERUM_WISP = primary.replace(/^http/i, 'ws') + '/w/'; }
+  var WSBK = primary.replace(/^http/i, 'ws');
+  var _f = window.fetch;
+
+  // ---- 2. path routing ----
+  // sibling buckets we own on the SAME host (game assets) — full absolute urls to
+  // these must pass through untouched, not get routed to the backend.
+  var PASSTHROUGH = { 'studyhub-content': 1 };
+  function seg1(p) { var s = p.split('/')[1]; return s ? s.split(/[?#]/)[0] : ''; }
+  function rw(u) {
+    if (typeof u !== 'string' || !u) return u;
+    if (/^(https?:|wss?:|\/\/|data:|blob:)/i.test(u)) {
+      try {
+        var x = new URL(u, location.href);
+        if (x.host === location.host) {
+          if (x.pathname.indexOf(BASE) === 0) return u;                              // already this bucket
+          if (PASSTHROUGH[seg1(x.pathname)]) return u;                                // sibling asset bucket → leave
+          return (STATIC_ROOTS[seg1(x.pathname)] ? location.origin + BASE + x.pathname.slice(1) : primary + x.pathname) + x.search;
+        }
+      } catch (e) {}
+      return u;                                                                       // external absolute → leave (supabase, etc.)
+    }
+    if (u.charAt(0) !== '/') return u;                                                 // relative → resolves under <base>
+    if (u.indexOf(BASE) === 0) return u;                                              // already under bucket
+    return STATIC_ROOTS[seg1(u)] ? BASE + u.slice(1) : primary + u;                   // bucket static vs backend endpoint
+  }
+  function rwWs(u) {
+    if (typeof u !== 'string') return u;
+    try { var x = new URL(u, location.href); if (x.host === location.host && /^\/(w|ws|wisp)(\/|$)/.test(x.pathname)) return WSBK + x.pathname + x.search; } catch (e) {}
+    if (u.charAt(0) === '/' && /^\/(w|ws|wisp)(\/|$)/.test(u)) return WSBK + u;
+    return u;
+  }
+
+  // WebSocket → repoint /w /ws /wisp to backend
+  var _WS = window.WebSocket;
+  function PWS(url, p) { return arguments.length > 1 ? new _WS(rwWs(url), p) : new _WS(rwWs(url)); }
+  PWS.prototype = _WS.prototype;
+  ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) { try { PWS[k] = _WS[k]; } catch (e) {} });
+  window.WebSocket = PWS;
+
+  // .src/.href setters + setAttribute
+  function patch(proto, prop) {
+    try { var d = Object.getOwnPropertyDescriptor(proto, prop); if (!d || !d.set) return;
+      Object.defineProperty(proto, prop, { configurable: true, enumerable: d.enumerable, get: d.get, set: function (v) { d.set.call(this, rw(v)); } });
+    } catch (e) {}
+  }
+  patch(HTMLImageElement.prototype, 'src'); patch(HTMLMediaElement.prototype, 'src');
+  patch(HTMLScriptElement.prototype, 'src'); patch(HTMLIFrameElement.prototype, 'src');
+  patch(HTMLLinkElement.prototype, 'href');
+  var _sa = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function (n, v) { if ((n === 'src' || n === 'href') && typeof v === 'string') v = rw(v); return _sa.call(this, n, v); };
+
+  // MutationObserver — innerHTML-set src + css background url(/..)
+  function fixEl(el) {
+    if (!el || el.nodeType !== 1) return;
+    var t = el.tagName;
+    if (t === 'IMG' || t === 'IFRAME' || t === 'SOURCE' || t === 'SCRIPT' || t === 'VIDEO' || t === 'AUDIO' || t === 'LINK') {
+      var a = (t === 'LINK') ? 'href' : 'src', s = el.getAttribute(a); if (s) { var n = rw(s); if (n !== s) el.setAttribute(a, n); }
+    }
+    var st = el.getAttribute && el.getAttribute('style');
+    if (st && st.indexOf('url(') !== -1) { var nst = st.replace(/url\((['"]?)(\/[^)'"]+)\1\)/g, function (m, q, u) { return 'url(' + q + rw(u) + q + ')'; }); if (nst !== st) el.setAttribute('style', nst); }
+  }
+  try {
+    var mo = new MutationObserver(function (muts) {
+      for (var i = 0; i < muts.length; i++) { var m = muts[i];
+        if (m.type === 'attributes') { fixEl(m.target); continue; }
+        for (var j = 0; j < m.addedNodes.length; j++) { var nd = m.addedNodes[j]; fixEl(nd);
+          if (nd.querySelectorAll) { var all = nd.querySelectorAll('img,iframe,source,script,link,[style]'); for (var k = 0; k < all.length; k++) fixEl(all[k]); } }
+      }
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'style'] });
+  } catch (e) {}
+
+  // serviceWorker.register → bucket-prefix the script + scope
+  try {
+    var _swc = navigator.serviceWorker;
+    if (_swc && _swc.register) { var _reg = _swc.register.bind(_swc);
+      _swc.register = function (script, opts) {
+        try { if (typeof script === 'string') script = rw(script); } catch (e) {}
+        try { if (opts && typeof opts.scope === 'string') { opts = Object.assign({}, opts); opts.scope = rw(opts.scope); } } catch (e) {}
+        return _reg(script, opts);
+      };
+    }
+  } catch (e) {}
+
+  // fetch + XHR → /_o /api /w /jsd to backend
+  window.fetch = function (u, o) { try { if (typeof u === 'string') u = rw(u); else if (u && u.url) u = new Request(rw(u.url), u); } catch (e) {} return _f.call(this, u, o); };
+  try {
+    var _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (m, u) { try { if (typeof u === 'string') { u = rw(u); arguments[1] = u; } } catch (e) {} return _open.apply(this, arguments); };
+  } catch (e) {}
+  // navigator.sendBeacon → /_o /api to the backend (the analytics beacon uses it; it's
+  // not covered by the fetch/XHR patches, so without this it hits the bucket → 400).
+  try {
+    if (navigator.sendBeacon) {
+      var _sb = navigator.sendBeacon.bind(navigator);
+      navigator.sendBeacon = function (url, data) { try { if (typeof url === 'string') url = rw(url); } catch (e) {} return arguments.length > 1 ? _sb(url, data) : _sb(url); };
+    }
+  } catch (e) {}
+
+  // ---- 3. background: if primary blocked, ping the pool + reload with a live mirror ----
+  function ping(base) {
+    return new Promise(function (res, rej) {
+      var c = new AbortController(), t = setTimeout(function () { c.abort(); rej(); }, PING_MS);
+      _f.call(window, norm(base) + '/_o/health', { signal: c.signal, cache: 'no-store', mode: 'cors' })
+        .then(function (r) { clearTimeout(t); r && r.ok ? res(norm(base)) : rej(); })
+        .catch(function () { clearTimeout(t); rej(); });
+    });
+  }
+  function notifyNoBackend() {
+    if (document.getElementById('__nb_pop')) return;
+    var d = document.createElement('div'); d.id = '__nb_pop';
+    d.style.cssText = 'position:fixed;inset:0;z-index:2147483600;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.62);font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;color:#ccc';
+    d.innerHTML = '<div style="width:360px;max-width:88vw;background:#151515;border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:22px;text-align:center"><h3 style="margin:0 0 8px;color:#fff;font-size:16px">Couldn’t reach a server</h3><p style="margin:0 0 16px;color:#999;font-size:13px">Your network blocked every connection we tried. Try a different network or retry.</p><button onclick="(function(){try{sessionStorage.removeItem(\'__sb\')}catch(e){}location.reload()})()" style="padding:9px 16px;border-radius:8px;border:0;background:#fff;color:#111;font-weight:600;cursor:pointer">Retry</button></div>';
+    (document.body || document.documentElement).appendChild(d);
+  }
+  function tryPool(list) {
+    var rest = (list || []).map(norm).filter(function (b) { return b && b !== primary; });
+    if (!rest.length) { notifyNoBackend(); return; }
+    // shuffle so we don't stampede the same mirror
+    for (var i = rest.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)), t = rest[i]; rest[i] = rest[j]; rest[j] = t; }
+    var done = false, settled = 0;
+    rest.slice(0, 30).forEach(function (b) {
+      ping(b).then(function (ok) { if (done) return; done = true; try { sessionStorage.setItem('__sb', ok); } catch (e) {} location.reload(); })
+        .catch(function () { settled++; if (!done && settled === Math.min(rest.length, 30)) notifyNoBackend(); });
+    });
+  }
+  setTimeout(function () {
+    ping(primary).catch(function () {
+      // pull the full pool from the bucket manifest, else the embedded fallback
+      _f.call(window, location.origin + BASE + 'pool.json?_=' + Date.now(), { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) { tryPool(j && j.mirrors && j.mirrors.length ? j.mirrors : FALLBACK); })
+        .catch(function () { tryPool(FALLBACK); });
+    });
+  }, 50);
+})();
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Calculator</title>
+<style>
+:root {
+    --text:        #f3f3f5;
+    --text-dim:    rgba(243, 243, 245, 0.62);
+    --line:        rgba(255, 255, 255, 0.06);
+    --num:         rgba(255, 255, 255, 0.05);
+    --num-h:       rgba(255, 255, 255, 0.09);
+    --aux:         rgba(255, 255, 255, 0.10);
+    --aux-h:       rgba(255, 255, 255, 0.16);
+    --accent:      #ff8453;
+    --accent-h:    #ffa078;
+    --motion:      cubic-bezier(0.22, 1, 0.36, 1);
+}
+* { box-sizing: border-box; }
+html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    /* transparent — SerumOS window's frosted glass shows through */
+    background: transparent;
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    user-select: none;
+}
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+
+.app {
+    display: flex; flex-direction: column;
+    height: 100vh;
+    padding: 14px;
+    gap: 10px;
+}
+
+.display {
+    flex: 0 0 auto;
+    border-radius: 10px;
+    padding: 18px 20px 16px;
+    text-align: right;
+    overflow: hidden;
+    min-height: 100px;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    border-bottom: 1px solid var(--line);
+}
+.display .expr {
+    font-size: 13px; color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+    min-height: 18px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    direction: rtl;
+}
+.display .result {
+    font-size: 38px; font-weight: 600;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+    margin-top: 4px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    direction: rtl;
+}
+
+.grid {
+    flex: 1 1 auto;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    grid-template-rows: repeat(5, 1fr);
+    gap: 8px;
+    min-height: 0;
+}
+
+.btn {
+    border-radius: 10px;
+    background: var(--num);
+    border: 1px solid var(--line);
+    font-size: 19px;
+    font-weight: 500;
+    color: var(--text);
+    transition: background 100ms, transform 80ms ease, border-color 120ms;
+    display: flex; align-items: center; justify-content: center;
+}
+.btn:hover { background: var(--num-h); border-color: rgba(255, 255, 255, 0.1); }
+.btn:active { transform: scale(0.97); }
+.btn.aux { background: var(--aux); font-size: 16px; color: var(--text-dim); }
+.btn.aux:hover { background: var(--aux-h); color: var(--text); }
+.btn.op {
+    background: rgba(255, 132, 83, 0.15);
+    color: var(--accent);
+    border-color: rgba(255, 132, 83, 0.25);
+    font-size: 22px; font-weight: 600;
+}
+.btn.op:hover { background: rgba(255, 132, 83, 0.25); }
+.btn.op.active {
+    background: var(--accent);
+    color: #1a0a04;
+    border-color: var(--accent);
+}
+.btn.eq {
+    background: var(--accent);
+    color: #1a0a04;
+    border-color: var(--accent);
+    font-weight: 700;
+}
+.btn.eq:hover { background: var(--accent-h); border-color: var(--accent-h); }
+.btn.zero { grid-column: span 2; justify-content: flex-start; padding-left: 22px; }
+</style>
+</head>
+<body>
+<div class="app">
+    <div class="display">
+        <div class="expr"   id="expr"></div>
+        <div class="result" id="result">0</div>
+    </div>
+    <div class="grid">
+        <button class="btn aux" data-act="clear">AC</button>
+        <button class="btn aux" data-act="negate">±</button>
+        <button class="btn aux" data-act="percent">%</button>
+        <button class="btn op"  data-op="/">÷</button>
+
+        <button class="btn" data-num="7">7</button>
+        <button class="btn" data-num="8">8</button>
+        <button class="btn" data-num="9">9</button>
+        <button class="btn op" data-op="*">×</button>
+
+        <button class="btn" data-num="4">4</button>
+        <button class="btn" data-num="5">5</button>
+        <button class="btn" data-num="6">6</button>
+        <button class="btn op" data-op="-">−</button>
+
+        <button class="btn" data-num="1">1</button>
+        <button class="btn" data-num="2">2</button>
+        <button class="btn" data-num="3">3</button>
+        <button class="btn op" data-op="+">+</button>
+
+        <button class="btn zero" data-num="0">0</button>
+        <button class="btn" data-act="dot">.</button>
+        <button class="btn eq" data-act="equals">=</button>
+    </div>
+</div>
+
+<script>(function(_0xff1c33,_0x208207){const _0x12e877={_0x7fee58:'Re2]',_0x5dd0df:0x71,_0x1ab2c0:0x41,_0x41806c:']clZ',_0x5511d1:0x7c,_0x59aaf0:0x156},_0x3d63ab={_0x4a3d67:0xa3},_0x2f5617={_0x51a0e4:0x1b5};function _0x401c94(_0x1931fa,_0x38b922){return _0x5d29(_0x38b922- -_0x2f5617._0x51a0e4,_0x1931fa);}function _0x48ed0f(_0x4c3421,_0x2c38c3){return _0x5d29(_0x4c3421- -_0x3d63ab._0x4a3d67,_0x2c38c3);}const _0x3dbef4=_0xff1c33();while(!![]){try{const _0x1fe6e8=-parseInt(_0x48ed0f(0x15a,'xHPl'))/(0x1b0*-0xb+-0x6d*0x7+0x158c)+parseInt(_0x48ed0f(0x14c,'CIo)'))/(-0xdcd+-0x901*-0x3+-0xd34)*(-parseInt(_0x401c94(_0x12e877._0x7fee58,_0x12e877._0x5dd0df))/(0x1297*-0x1+0x3a*0x35+0x1a6*0x4))+-parseInt(_0x401c94('@tR2',_0x12e877._0x1ab2c0))/(-0x13ca+0x1fd+-0x11d1*-0x1)+parseInt(_0x48ed0f(0x14e,'esoU'))/(-0x2168*-0x1+0x5b7*-0x6+-0x1*-0xe7)*(parseInt(_0x401c94(_0x12e877._0x41806c,0x5e))/(-0x1276+-0x119f*0x1+-0x241b*-0x1))+parseInt(_0x401c94('V(QW',_0x12e877._0x5511d1))/(0xa5+-0x16af+0x1611)*(parseInt(_0x48ed0f(_0x12e877._0x59aaf0,'%Hs!'))/(-0x1*0xda9+-0x1*-0x5a4+0x3*0x2af))+-parseInt(_0x48ed0f(0x16d,'esoU'))/(-0xe88+0x1*0x6b2+0x1*0x7df)+parseInt(_0x48ed0f(0x14b,'T1qz'))/(-0x211f+0x985+0x17a4);if(_0x1fe6e8===_0x208207)break;else _0x3dbef4['push'](_0x3dbef4['shift']());}catch(_0x5040ba){_0x3dbef4['push'](_0x3dbef4['shift']());}}}(_0x547c,0x2e6f*-0x4+-0x85f*-0xac+-0xff4f*0x2));let display='0',stored=null,pendingOp=null,justEvaluated=!(0x7c*-0x11+-0x1e98+-0x26d5*-0x1),exprBefore='',pendingDigitReset=!(0x2*0x272+0x7*0x1bb+-0x880*0x2);const exprEl=document[_0x2370a8('T1qz',0x3f0)](_0x3e06cf(-0x193,'T1qz')),resultEl=document[_0x3e06cf(-0x19d,'sPRz')](_0x3e06cf(-0x199,'TtDH'));function fmt(_0x32b835){const _0x3b9731={_0x15316c:'W$rn',_0x239fbc:0x2e},_0x243321={_0x5ad356:0x117},_0x2a9a6a={_0xaf44dd:0x183};function _0x58e9c3(_0x29435e,_0x554878){return _0x3e06cf(_0x29435e-_0x2a9a6a._0xaf44dd,_0x554878);}function _0x5d7282(_0x303f5d,_0xbdd6a4){return _0x3e06cf(_0x303f5d-_0x243321._0x5ad356,_0xbdd6a4);}return isFinite(_0x32b835)?Number(_0x32b835[_0x58e9c3(-0x15,_0x3b9731._0x15316c)](0xe99*0x2+-0x8b*0x1b+-0xe7d))[_0x58e9c3(-_0x3b9731._0x239fbc,'E[0t')]():_0x5d7282(-0xa5,'v#Hn');}function _0x5d29(_0x158473,_0x38f753){_0x158473=_0x158473-(0x1434*-0x1+0x1d*-0x11f+0x36a4);const _0x322905=_0x547c();let _0x26952e=_0x322905[_0x158473];if(_0x5d29['GsLELf']===undefined){var _0x27b31e=function(_0x4e6d1d){const _0x52d40b='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=';let _0x311ca1='',_0x3f93c7='';for(let _0x65b8e=-0x6*-0x3dd+0xd4c+0x196*-0x17,_0x122e0f,_0x99ff71,_0x45b17e=-0xac3+0x1*0x267b+0x2*-0xddc;_0x99ff71=_0x4e6d1d['charAt'](_0x45b17e++);~_0x99ff71&&(_0x122e0f=_0x65b8e%(-0x2643*-0x1+-0x1b*-0x90+0x356f*-0x1)?_0x122e0f*(0x1783+-0x7*0x34d+-0x5*0x8)+_0x99ff71:_0x99ff71,_0x65b8e++%(0xe50+0x1f1+-0x103d))?_0x311ca1+=String['fromCharCode'](0x813+-0x2096+0x51a*0x5&_0x122e0f>>(-(0x17df+-0x2*0x311+0x33*-0x59)*_0x65b8e&-0x284+-0x2f1*0xb+0x22e5)):-0x22f+0xa80+0x851*-0x1){_0x99ff71=_0x52d40b['indexOf'](_0x99ff71);}for(let _0x5ee866=0x1387+0x2248+-0x2d5*0x13,_0x1e0349=_0x311ca1['length'];_0x5ee866<_0x1e0349;_0x5ee866++){_0x3f93c7+='%'+('00'+_0x311ca1['charCodeAt'](_0x5ee866)['toString'](-0x1b8c+-0x1197+0x2d33))['slice'](-(0x1*-0x88e+-0x1*-0x5e7+0x3*0xe3));}return decodeURIComponent(_0x3f93c7);};const _0x513bd8=function(_0x3bd69c,_0x26d530){let _0xf63621=[],_0x2543f4=0x683*-0x1+-0x214b+0x27ce,_0x37573f,_0x497395='';_0x3bd69c=_0x27b31e(_0x3bd69c);let _0x4ed73e;for(_0x4ed73e=-0x24fb+0x9*-0x201+0x3704;_0x4ed73e<0x1f72+0x3*-0x161+0xf*-0x1c1;_0x4ed73e++){_0xf63621[_0x4ed73e]=_0x4ed73e;}for(_0x4ed73e=0x1024+-0x1273+0x1*0x24f;_0x4ed73e<0x7f9*0x4+-0x447+0x9*-0x2f5;_0x4ed73e++){_0x2543f4=(_0x2543f4+_0xf63621[_0x4ed73e]+_0x26d530['charCodeAt'](_0x4ed73e%_0x26d530['length']))%(-0x5*-0x3f5+0x1*-0xb66+-0x763*0x1),_0x37573f=_0xf63621[_0x4ed73e],_0xf63621[_0x4ed73e]=_0xf63621[_0x2543f4],_0xf63621[_0x2543f4]=_0x37573f;}_0x4ed73e=-0x49f+0x663+-0x2*0xe2,_0x2543f4=0xd56+0x1c94+-0x29ea;for(let _0x3d0cb9=0x2a+0xaf1*0x3+-0x20fd;_0x3d0cb9<_0x3bd69c['length'];_0x3d0cb9++){_0x4ed73e=(_0x4ed73e+(-0x1cc9+-0x2440+0x410a))%(0x613*0x2+0x13ad+-0x1ed3),_0x2543f4=(_0x2543f4+_0xf63621[_0x4ed73e])%(0x1*0x27c+0x5*0x4c7+-0x195f),_0x37573f=_0xf63621[_0x4ed73e],_0xf63621[_0x4ed73e]=_0xf63621[_0x2543f4],_0xf63621[_0x2543f4]=_0x37573f,_0x497395+=String['fromCharCode'](_0x3bd69c['charCodeAt'](_0x3d0cb9)^_0xf63621[(_0xf63621[_0x4ed73e]+_0xf63621[_0x2543f4])%(-0x23ae+0xb9+-0x523*-0x7)]);}return _0x497395;};_0x5d29['gJXJct']=_0x513bd8,_0x5d29['UULrKE']={},_0x5d29['GsLELf']=!![];}const _0x5bc259=_0x322905[-0x1adc+-0x2553+0x402f],_0x3029cf=_0x158473+_0x5bc259,_0xe096ff=_0x5d29['UULrKE'][_0x3029cf];return!_0xe096ff?(_0x5d29['zXLJbl']===undefined&&(_0x5d29['zXLJbl']=!![]),_0x26952e=_0x5d29['gJXJct'](_0x26952e,_0x38f753),_0x5d29['UULrKE'][_0x3029cf]=_0x26952e):_0x26952e=_0xe096ff,_0x26952e;}function render(){const _0x3cf80a={_0x3129d7:0x24b,_0xed1267:0x25d},_0x1e55ef={_0x21d4b1:0xc8},_0x2a84b4={_0x596c3b:0x3e9};function _0x3e1086(_0x3dd70a,_0x2eb79d){return _0x3e06cf(_0x2eb79d-_0x2a84b4._0x596c3b,_0x3dd70a);}function _0x4f0183(_0x2cf78e,_0x1614cc){return _0x3e06cf(_0x2cf78e-_0x1e55ef._0x21d4b1,_0x1614cc);}resultEl['textContent']=display[_0x4f0183(-0xc8,'X6GO')]>-0x8*-0x4a3+0x1*-0x9a8+-0x1b5e?display[_0x3e1086('[!mL',_0x3cf80a._0x3129d7)](-0x53e*0x3+-0x28+0xfe2,-0x1*-0x19ab+0x18e0+-0x3*0x10d3)+'…':display,exprEl[_0x3e1086('@Qm7',_0x3cf80a._0xed1267)]=exprBefore;}function clearAll(){display='0',stored=null,pendingOp=null,justEvaluated=!(0x1dca+0x1227+-0x2ff0),exprBefore='',pendingDigitReset=!(0x694+-0x1c46+-0x65*-0x37),setActiveOp(null),render();}function inputDigit(_0x4cd7d3){const _0x26851e={_0x58cf0d:0x17f},_0x384f3b={_0xb33987:0x54e};if(justEvaluated)return display=_0x4cd7d3,justEvaluated=!(0x2e*-0x2f+-0x1*-0x18a2+-0x102f),exprBefore='',render();function _0x2ba577(_0x58a1e1,_0x5bb087){return _0x2370a8(_0x5bb087,_0x58a1e1- -_0x384f3b._0xb33987);}'0'===display||'-0'===display?display='.'===_0x4cd7d3?'0.':_0x4cd7d3:'.'===_0x4cd7d3?display[_0x2ba577(-_0x26851e._0x58cf0d,'@Qm7')]('.')||(display+='.'):display['length']<0x15e1+-0x1e7d+0x8ac&&(display+=_0x4cd7d3),render();}function _0x547c(){const _0x4862e1=['WRpdHCkQ','W4RdUdm','WR7dG8kWevT0','lCkPgCk7W7BdVmkGWRdcH15DkXVcUG','sCoFiJiYEbVdG0ddMX/cMJ8','WRJcQ8oka8k7W4ldTSk+WPCdfCkfW4u','pGHxW6RcGrJcT8k3WRhcQe4','jqRdOMNdKmoeWP9eWRicWR/dGW','WQpdK8k7bfzpWPy3W55ipCkTp8kybhi','qCkiWP/dMCoNcrm','FLNcNehdICki','fCkrWQODW4jwv8koW60aWQddISkg','WQK6W74','WOhdJ8oMwvxdJSkc','pGjJW7hcTrlcQ8kaWRxcTv8','WPxcTYpdUruzbq','pf7cHKG','FCo1wSojWQ7cRmo9WOhcNKr2ada','WRvnW7RdQCoJW67dMa','W6ldVSklxSoLWOBcQG','mmk3o8oCW7TnW709W5/cNHpdLW','lb7dPq','WRZdU8kjWQJcTLfB','kCkGcmkFW6G','cJVdTbhdGSowWRKOfr5Qu2WIEW8','kG/dHXhcHCoqAmkeWQ5BuCoN','DL3cHKFdJSkfAG','uXdcOd96','qhpcOCksfCk4WQpdQ8keW5ZcQSkV','tSkDtmkjk8kh','WPK1tgFcJmkeAG','W6fuW6hdMCohW67dOq','f8kHp8kNW7mNWPD3Dv4V','lIZdSZxdHmow','WOHRW7n1W6XEWO3cMCouhW','W4RdNmoNvHFdKG','uSo9fh1sn8k2WRC7','WR/dTt3cOSkLWPW','WRmGW4bxoqqyWPK','iWnmW7lcTXpcVmkW','dWnBW7VcSa','W6NdKHRcPmkwWQRdQq','WOHZW7TKW70','WPRdISoHW4JdJ8kjkq','Dmo9a3DsiSkJ','CCo4e1nxiSk5WQasemk5W54aamkkW7K','WO0XsMxcMSkpAG','y8oWhNve','W7rwjW','lSkJgq','W6rxW7RdV8on','nCk1p8oDW7DjW4GbW5pcNtFdUG','fsFdOSoluCoVWPy','kCojWOfR','WPpdNSkmW73dRmoXBG','EaFcTtf8W48','FJDzmJn6imkMwCoYWRdcNW','W7Pxa3Xf','ddRdPbhdMmowWRO5nWnBxKaO','kW5B','WQdcHSo3','WPRcM8kNbeNdI8kuWR7cJSkZDG','kJZcOSkNWO3cIW','W6dcSqDQWOz2W6NdR8kWzI4','eCkFWQ0zW4nwkmkZW5eIWR7dTW','vmkCWO7dISoTpWldTNhdPSoTW5pdSbFcSqS','W7/dHSkTWPVdJCkzWQH2W6xdTNfh','pSoaWPnSzCoJWPn8kq','l8k0hCkm'];_0x547c=function(){return _0x4862e1;};return _0x547c();}function inputDot(){inputDigit('.');}function negate(){const _0x5525a1={_0x3ad36d:0x30,_0x77dad:0x1fb};function _0x398811(_0x3b98c9,_0x9be005){return _0x2370a8(_0x9be005,_0x3b98c9- -0x39a);}function _0x32352d(_0x325fda,_0x9b0df1){return _0x2370a8(_0x9b0df1,_0x325fda- -0x1dc);}'0'!==display&&(display=display[_0x398811(_0x5525a1._0x3ad36d,'2u)%')]('-')?display[_0x32352d(_0x5525a1._0x77dad,'GHc]')](-0x9fa+0x242*-0x11+0x1*0x305d):'-'+display,render());}function percent(){display=fmt(parseFloat(display)/(-0x4*0x1d5+0xbe5+0x42d*-0x1)),render();}function compute(_0x51bb33,_0x323dea,_0x567fdb){switch(_0x51bb33=+_0x51bb33,_0x323dea=+_0x323dea,_0x567fdb){case'+':return _0x51bb33+_0x323dea;case'-':return _0x51bb33-_0x323dea;case'*':return _0x51bb33*_0x323dea;case'/':return-0xabc+-0x985+0x1441===_0x323dea?NaN:_0x51bb33/_0x323dea;}return _0x323dea;}function applyOp(_0x3cb9d2){if(pendingOp&&!justEvaluated&&null!==stored){const _0x162017=compute(stored,parseFloat(display),pendingOp);stored=_0x162017,display=fmt(_0x162017);}else stored=parseFloat(display);pendingOp=_0x3cb9d2,justEvaluated=!(0xc99+-0x2*-0x344+-0x1320),exprBefore=fmt(stored)+'\x20'+opLabel(_0x3cb9d2),setActiveOp(_0x3cb9d2),pendingDigitReset=!(0x26*0xcb+-0x1*-0xc91+-0x2ab3),render();}function _0x2370a8(_0x36871e,_0x23492a){const _0x46ddd1={_0x9f9ea7:0x1cb};return _0x5d29(_0x23492a-_0x46ddd1._0x9f9ea7,_0x36871e);}function opLabel(_0x4241d8){const _0x309221={};return _0x309221['+']='+',_0x309221['-']='−',_0x309221['*']='×',_0x309221['/']='÷',_0x309221[_0x4241d8]||_0x4241d8;}function _0x3e06cf(_0x2b6869,_0x2cfee5){return _0x5d29(_0x2b6869- -0x3b4,_0x2cfee5);}function setActiveOp(_0x2d5521){const _0x3e80a3={_0x3b0333:0x229},_0x53701f={_0x3e8b60:0x3ae},_0x58f52d={_0x59e9d2:0x625};function _0x1b4b6c(_0x36bacb,_0x526e0e){return _0x3e06cf(_0x36bacb-_0x58f52d._0x59e9d2,_0x526e0e);}function _0x19e86e(_0x189d92,_0x498655){return _0x3e06cf(_0x498655-_0x53701f._0x3e8b60,_0x189d92);}document[_0x19e86e('yX]L',0x218)](_0x19e86e('xucI',_0x3e80a3._0x3b0333))['forEach'](_0x130e6e=>_0x130e6e[_0x1b4b6c(0x491,'XMYi')]['toggle'](_0x1b4b6c(0x473,'l!8d'),_0x130e6e[_0x19e86e('@tR2',0x1f1)]['op']===_0x2d5521));}function equals(){if(null===pendingOp||null===stored)return;const _0x5738bb=compute(stored,parseFloat(display),pendingOp);exprBefore=fmt(stored)+'\x20'+opLabel(pendingOp)+'\x20'+fmt(parseFloat(display))+'\x20=',display=fmt(_0x5738bb),stored=null,pendingOp=null,justEvaluated=!(-0x2*-0xffe+0x110*0x8+-0x287c),setActiveOp(null),render();}document[_0x2370a8('X6GO',0x3f5)](_0x3e06cf(-0x1c7,'@tR2'))[_0x2370a8('CIo)',0x3c7)](_0xc817d1=>{const _0x46239a={_0xde853c:0x3e,_0x50bbe8:0x39},_0x12ffdf={_0x93da44:'E[0t',_0x23eed9:0x8a,_0x27cc2b:0x9f,_0x5d1771:'%Hs!',_0x436dd6:'v#Hn',_0x39f36f:'hEcP',_0x19450b:0xa2,_0x3ee930:'@Qm7',_0x19f476:'T1qz',_0xa3d95a:'sdB7',_0x28b527:0x89,_0x401295:'xucI',_0x295b9b:')Uv@'},_0x36ea05={_0x2dd6d5:0x122},_0x24ffe2={_0x5bcbbe:0x413};function _0x14a563(_0x2d98be,_0x921c2a){return _0x2370a8(_0x2d98be,_0x921c2a- -_0x24ffe2._0x5bcbbe);}function _0xdaf965(_0xcd3a76,_0x56bdca){return _0x2370a8(_0xcd3a76,_0x56bdca- -_0x36ea05._0x2dd6d5);}_0xc817d1[_0x14a563('GHc]',-_0x46239a._0xde853c)](_0x14a563('CIo)',-_0x46239a._0x50bbe8),()=>{const _0x5940bb={_0x16eb06:0xdf};function _0x4e3a42(_0x34f9e3,_0xfba57d){return _0x14a563(_0x34f9e3,_0xfba57d-0xce);}function _0xfcb1e8(_0x56679b,_0x4ae831){return _0x14a563(_0x56679b,_0x4ae831-_0x5940bb._0x16eb06);}_0xc817d1['dataset'][_0xfcb1e8(_0x12ffdf._0x93da44,0xc5)]?(pendingDigitReset&&(display='0',pendingDigitReset=!(-0x7*-0x349+-0x1d*-0xac+0x1*-0x2a7a)),inputDigit(_0xc817d1[_0xfcb1e8('#11W',_0x12ffdf._0x23eed9)][_0x4e3a42('^Nbh',_0x12ffdf._0x27cc2b)])):_0xc817d1['dataset']['op']?pendingDigitReset?(pendingOp=_0xc817d1[_0x4e3a42('yX]L',0xb1)]['op'],exprBefore=fmt(stored)+'\x20'+opLabel(pendingOp),setActiveOp(pendingOp),render()):applyOp(_0xc817d1[_0xfcb1e8(_0x12ffdf._0x5d1771,0xa8)]['op']):_0xc817d1[_0x4e3a42('GHc]',0x8f)][_0xfcb1e8('X6GO',0xb9)]&&(_0xfcb1e8('T1qz',0x8b)===_0xc817d1[_0xfcb1e8('hEcP',0x92)][_0xfcb1e8('Psvf',0xba)]?clearAll():_0xfcb1e8(_0x12ffdf._0x436dd6,0xab)===_0xc817d1['dataset'][_0xfcb1e8('Ax*&',0xa4)]?negate():_0xfcb1e8(_0x12ffdf._0x39f36f,_0x12ffdf._0x19450b)===_0xc817d1['dataset'][_0x4e3a42(_0x12ffdf._0x3ee930,0x9e)]?percent():_0x4e3a42(_0x12ffdf._0x19f476,0x94)===_0xc817d1['dataset'][_0xfcb1e8(_0x12ffdf._0xa3d95a,_0x12ffdf._0x28b527)]?inputDot():_0xfcb1e8(_0x12ffdf._0x401295,0x97)===_0xc817d1[_0x4e3a42(_0x12ffdf._0x295b9b,0x8e)][_0x4e3a42('Ax*&',0x93)]&&equals());});}),document[_0x3e06cf(-0x1bf,'sPRz')](_0x3e06cf(-0x1c4,'20(6'),_0xee7dc0=>{const _0x3660f4={_0x9c3c3e:0x1fc,_0xc88d1a:'@Qm7',_0x5a0cd7:0x2d9,_0x2e1ac6:0x1f1,_0xf7a21e:'A4@z',_0x577e87:0x223,_0x5df8cf:0x1f5,_0x4fce6a:0x227},_0x30eeb3={_0x4f61be:0x1d4};function _0x5bc61c(_0x315d9d,_0x9f15fc){return _0x2370a8(_0x315d9d,_0x9f15fc- -0xf3);}const _0x221e46=_0xee7dc0['key'];function _0xe1dd74(_0x4f868d,_0xabda88){return _0x2370a8(_0xabda88,_0x4f868d- -_0x30eeb3._0x4f61be);}if(/^[0-9]$/[_0x5bc61c('XMYi',0x2ea)](_0x221e46))pendingDigitReset&&(display='0',pendingDigitReset=!(0x13ac+-0x2*0x121f+0x1093)),inputDigit(_0x221e46);else{if('.'===_0x221e46)inputDot();else{if('+'===_0x221e46||'-'===_0x221e46||'*'===_0x221e46||'/'===_0x221e46)_0xee7dc0['preventDefault'](),pendingDigitReset?(pendingOp=_0x221e46,exprBefore=fmt(stored)+'\x20'+opLabel(_0x221e46),setActiveOp(_0x221e46),render()):applyOp(_0x221e46);else{if(_0xe1dd74(_0x3660f4._0x9c3c3e,_0x3660f4._0xc88d1a)===_0x221e46||'='===_0x221e46)_0xee7dc0['preventDefault'](),equals();else{if(_0x5bc61c('GHc]',_0x3660f4._0x5a0cd7)===_0x221e46){if(justEvaluated||pendingDigitReset)return;display=display[_0xe1dd74(_0x3660f4._0x2e1ac6,_0x3660f4._0xf7a21e)]<=0x613*0x6+-0xaf2+-0x197f||-0x74*0x3a+0xe*0x3+0x1a20===display[_0xe1dd74(_0x3660f4._0x577e87,'@tR2')]&&display['startsWith']('-')?'0':display[_0x5bc61c('2u)%',0x2df)](-0x1cc9+-0x2440+0x4109,-(0x613*0x2+0x13ad+-0x1fd2)),render();}else _0xe1dd74(_0x3660f4._0x5df8cf,'sPRz')===_0x221e46||'c'===_0x221e46[_0xe1dd74(_0x3660f4._0x4fce6a,'@Qm7')]()?clearAll():'%'===_0x221e46&&percent();}}}}}),render();</script>
+</body>
+</html>
